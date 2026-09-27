@@ -15,7 +15,7 @@ fn main() {
     let stdin = io::stdin();
 
     println!("vellumdb 0.1.0 (wal: {wal_path})");
-    println!("commands: put <key> <value> | get <key> | delete <key> | exit");
+    println!("commands: put <key> <value> | get <key> | delete <key> | scan | exit");
 
     loop {
         print!("vellum> ");
@@ -63,6 +63,15 @@ fn main() {
                 },
                 None => println!("usage: delete <key>"),
             },
+            "scan" => {
+                for (key, value) in db.iter() {
+                    println!(
+                        "{}={}",
+                        String::from_utf8_lossy(key),
+                        String::from_utf8_lossy(value)
+                    );
+                }
+            }
             "exit" | "quit" => break,
             other => println!("unknown command: {other}"),
         }
