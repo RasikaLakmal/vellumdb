@@ -4,18 +4,18 @@ use std::io::{self, Write};
 use vellumdb::Db;
 
 fn main() {
-    let wal_path = env::args().nth(1).unwrap_or_else(|| "vellum.wal".to_string());
-    let mut db = match Db::open(&wal_path) {
+    let dir = env::args().nth(1).unwrap_or_else(|| "vellum-data".to_string());
+    let mut db = match Db::open(&dir) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("failed to open {wal_path}: {e}");
+            eprintln!("failed to open {dir}: {e}");
             std::process::exit(1);
         }
     };
     let stdin = io::stdin();
 
-    println!("vellumdb 0.1.0 (wal: {wal_path})");
-    println!("commands: put <key> <value> | get <key> | delete <key> | scan | exit");
+    println!("vellumdb 0.1.0 (dir: {dir}, {} sstables on disk)", db.sstable_count());
+    println!("commands: put <key> <value> | get <key> | delete <key> | scan | flush | exit");
 
     loop {
         print!("vellum> ");
@@ -50,8 +50,9 @@ fn main() {
             }
             "get" => match parts.next() {
                 Some(key) => match db.get(key.as_bytes()) {
-                    Some(value) => println!("{}", String::from_utf8_lossy(value)),
-                    None => println!("(not found)"),
+                    Ok(Some(value)) => println!("{}", String::from_utf8_lossy(&value)),
+                    Ok(None) => println!("(not found)"),
+                    Err(e) => println!("error: {e}"),
                 },
                 None => println!("usage: get <key>"),
             },
@@ -72,6 +73,10 @@ fn main() {
                     );
                 }
             }
+            "flush" => match db.flush() {
+                Ok(()) => println!("ok ({} sstables on disk)", db.sstable_count()),
+                Err(e) => println!("error: {e}"),
+            },
             "exit" | "quit" => break,
             other => println!("unknown command: {other}"),
         }

@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
+use crate::encoding::{read_bytes, write_bytes};
+
 const TAG_PUT: u8 = 0;
 const TAG_DELETE: u8 = 1;
 
@@ -72,18 +74,4 @@ impl Wal {
 
         Ok(records)
     }
-}
-
-fn write_bytes(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
-    w.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    w.write_all(bytes)
-}
-
-fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
 }
