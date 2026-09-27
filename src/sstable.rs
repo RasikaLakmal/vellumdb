@@ -2,28 +2,39 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::bloom::BloomFilter;
 use crate::encoding::{read_bytes, write_bytes};
 use crate::entry::{Entry, EntryValue};
 
 const TAG_PUT: u8 = 0;
 const TAG_TOMBSTONE: u8 = 1;
+const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 
-/// An immutable, sorted key-value file flushed from the memtable. No index or
-/// Bloom filter yet (that's milestone 5), so lookups are a linear scan.
+/// An immutable, sorted key-value file flushed from the memtable, plus a
+/// Bloom filter sidecar (`<id>.bloom`) that lets `get` skip opening the data
+/// file entirely for keys that definitely aren't in it. No other index yet,
+/// a key that might be present still costs a linear scan.
 pub struct SsTable {
     path: PathBuf,
+    bloom: BloomFilter,
 }
 
 impl SsTable {
     /// Write `entries` (must already be sorted by key, as memtable iteration
-    /// guarantees) to a new SSTable file at `path`.
+    /// guarantees) to a new SSTable file at `path`, plus its Bloom filter
+    /// sidecar. `expected_items` sizes the filter, it should be the number
+    /// of entries about to be written.
     pub fn write<'a>(
         path: impl AsRef<Path>,
         entries: impl Iterator<Item = (&'a Vec<u8>, &'a Entry)>,
+        expected_items: usize,
     ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let mut bloom = BloomFilter::new(expected_items, BLOOM_FALSE_POSITIVE_RATE);
         let mut writer = BufWriter::new(File::create(&path)?);
+
         for (key, entry) in entries {
+            bloom.insert(key);
             write_bytes(&mut writer, key)?;
             writer.write_all(&entry.seq.to_le_bytes())?;
             match &entry.value {
@@ -35,16 +46,25 @@ impl SsTable {
             }
         }
         writer.flush()?;
-        Ok(SsTable { path })
+        bloom.write(bloom_path(&path))?;
+
+        Ok(SsTable { path, bloom })
     }
 
-    pub fn open(path: impl AsRef<Path>) -> Self {
-        SsTable { path: path.as_ref().to_path_buf() }
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let bloom = BloomFilter::load(bloom_path(&path))?;
+        Ok(SsTable { path, bloom })
     }
 
-    /// Linear scan lookup. Fine for now, an index/Bloom filter makes this
-    /// fast without reading the whole file once milestone 5 lands.
+    /// Checks the Bloom filter first, a `false` there means the key is
+    /// definitely absent and the data file is never opened. Otherwise falls
+    /// back to a linear scan (an index makes this faster later, no
+    /// milestone assigned yet).
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Entry>> {
+        if !self.bloom.might_contain(key) {
+            return Ok(None);
+        }
         for item in self.iter()? {
             let (k, entry) = item?;
             if k == key {
@@ -59,6 +79,10 @@ impl SsTable {
     pub fn iter(&self) -> io::Result<SsTableIter> {
         Ok(SsTableIter { reader: BufReader::new(File::open(&self.path)?) })
     }
+}
+
+fn bloom_path(sstable_path: &Path) -> PathBuf {
+    sstable_path.with_extension("bloom")
 }
 
 pub struct SsTableIter {

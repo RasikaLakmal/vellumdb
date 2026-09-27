@@ -1,3 +1,4 @@
+mod bloom;
 mod encoding;
 mod entry;
 mod sstable;
@@ -82,8 +83,10 @@ impl Db {
         sstable_files.sort_by_key(|(id, _)| *id);
 
         let next_sstable_id = sstable_files.last().map(|(id, _)| id + 1).unwrap_or(0);
-        let sstables: Vec<SsTable> =
-            sstable_files.into_iter().map(|(_, path)| SsTable::open(path)).collect();
+        let sstables: Vec<SsTable> = sstable_files
+            .into_iter()
+            .map(|(_, path)| SsTable::open(path))
+            .collect::<io::Result<Vec<_>>>()?;
 
         let mut max_seq: Option<u64> = None;
         for sstable in &sstables {
@@ -220,7 +223,7 @@ impl Db {
         }
 
         let path = dir.join(format!("{:06}.sst", self.next_sstable_id));
-        let sstable = SsTable::write(path, self.data.iter())?;
+        let sstable = SsTable::write(path, self.data.iter(), self.data.len())?;
         self.sstables.push(sstable);
         self.next_sstable_id += 1;
 
@@ -420,6 +423,28 @@ mod tests {
 
         assert_eq!(db.sstable_count(), 2);
         assert_eq!(db.get(b"foo").unwrap(), None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Proves the Bloom filter actually skips the data file for a
+    /// definitely-missing key, rather than just trusting it does: delete the
+    /// sstable's data file but leave its bloom sidecar in place. A missing
+    /// key still correctly resolves to `None` (the filter said "definitely
+    /// not here", so the file was never opened), while a key that might be
+    /// present now surfaces an IO error, since the filter said "maybe" and
+    /// the linear scan tried to open a file that's gone.
+    #[test]
+    fn bloom_filter_avoids_touching_disk_for_missing_keys() {
+        let dir = temp_db_dir("bloom_skip");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        db.flush().unwrap();
+        fs::remove_file(dir.join("000000.sst")).unwrap();
+
+        assert_eq!(db.get(b"definitely-not-a-key").unwrap(), None);
+        assert!(db.get(b"foo").is_err(), "bloom said maybe, so it should have tried the gone file");
 
         fs::remove_dir_all(&dir).unwrap();
     }
