@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -63,6 +63,14 @@ impl SsTable {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Deletes this sstable's data file and bloom sidecar from disk. Only
+    /// safe to call once nothing (in particular, the manifest) references
+    /// it anymore, otherwise a reopen would fail trying to load it.
+    pub fn remove_files(&self) -> io::Result<()> {
+        fs::remove_file(&self.path)?;
+        fs::remove_file(bloom_path(&self.path))
     }
 
     /// Checks the Bloom filter first, a `false` there means the key is

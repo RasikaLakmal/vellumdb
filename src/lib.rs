@@ -237,6 +237,65 @@ impl Db {
         self.memtable_size_bytes = 0;
         Ok(())
     }
+
+    /// Merge every current SSTable into a single new one. Duplicate keys
+    /// keep only the copy from the newest sstable, and tombstones are
+    /// dropped entirely, safe here specifically because this merges *all*
+    /// sstables at once, there's no older, not-yet-compacted file left that
+    /// a tombstone would still need to shadow. A no-op below two sstables,
+    /// there's nothing to merge, only the memtable is untouched by this,
+    /// flush and compaction stay separate operations.
+    ///
+    /// Loads every sstable's contents into memory to de-duplicate rather
+    /// than streaming a merge, that's an intentional simplification for
+    /// now. Milestone 8's merge iterator is the natural thing to swap this
+    /// to if benchmarking (milestone 13) ever shows it's a real bottleneck.
+    ///
+    /// Installs the merged result the same way `flush` installs a new
+    /// sstable: write the file, then atomically swap in a manifest that
+    /// references only it. A crash between those two steps leaves the old
+    /// sstables (and the old manifest pointing at them) untouched, and the
+    /// half-written merge file is ignored as an orphan on reopen, this
+    /// reuses the exact atomic-install path already proven crash-safe by
+    /// milestone 6's orphan test, so it isn't re-tested here.
+    pub fn compact(&mut self) -> io::Result<()> {
+        let Some(dir) = self.dir.clone() else {
+            return Ok(());
+        };
+        if self.sstables.len() < 2 {
+            return Ok(());
+        }
+
+        let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+        for sstable in &self.sstables {
+            for item in sstable.iter()? {
+                let (key, entry) = item?;
+                merged.insert(key, entry);
+            }
+        }
+        merged.retain(|_, entry| !matches!(entry.value, EntryValue::Tombstone));
+
+        let new_id = self.next_sstable_id;
+        let new_sstable =
+            SsTable::write(new_id, sstable_path(&dir, new_id), merged.iter(), merged.len())?;
+
+        let manifest = Manifest { sstable_ids: vec![new_id], next_seq: self.next_seq };
+        manifest.save(&dir)?;
+
+        // Only reached once the new manifest is durably installed, so it's
+        // now safe to drop our reference to the old sstables and delete
+        // their files. A crash before this point just leaves them as
+        // harmless files a future compaction would overwrite; a crash after
+        // partway through just leaks a few files, no orphan-sweeping exists
+        // yet to reclaim them, that's a nice-to-have, not a correctness gap.
+        let old_sstables = std::mem::replace(&mut self.sstables, vec![new_sstable]);
+        self.next_sstable_id += 1;
+        for old in old_sstables {
+            old.remove_files()?;
+        }
+
+        Ok(())
+    }
 }
 
 fn sstable_path(dir: &Path, id: u64) -> PathBuf {
@@ -484,6 +543,113 @@ mod tests {
         assert_eq!(db.sstable_count(), 0, "orphan isn't in the manifest, so it's not active");
         assert_eq!(db.get(b"foo").unwrap(), Some(b"bar".to_vec()), "recovered via wal replay");
         assert_eq!(db.get(&orphan_key).unwrap(), None, "orphan's data was never committed");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compact_below_two_sstables_is_a_noop() {
+        let dir = temp_db_dir("compact_noop");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.compact().unwrap();
+
+        assert_eq!(db.sstable_count(), 1, "nothing to merge with only one sstable");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compact_merges_multiple_sstables_and_keeps_all_live_keys() {
+        let dir = temp_db_dir("compact_merge");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"alpha".to_vec(), b"1".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"bravo".to_vec(), b"2".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"charlie".to_vec(), b"3".to_vec()).unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.sstable_count(), 3);
+
+        db.compact().unwrap();
+
+        assert_eq!(db.sstable_count(), 1);
+        assert_eq!(db.get(b"alpha").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"bravo").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"charlie").unwrap(), Some(b"3".to_vec()));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Not just "get returns the right value", proves the stale copy is
+    /// actually gone from disk after compaction, not merely shadowed.
+    #[test]
+    fn compact_drops_stale_overwritten_values() {
+        let dir = temp_db_dir("compact_overwrite");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"v1".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"foo".to_vec(), b"v2".to_vec()).unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+
+        assert_eq!(db.sstable_count(), 1);
+        assert_eq!(db.get(b"foo").unwrap(), Some(b"v2".to_vec()));
+
+        let entries: Vec<_> =
+            db.sstables[0].iter().unwrap().collect::<io::Result<Vec<_>>>().unwrap();
+        assert_eq!(entries.len(), 1, "only the newest copy of foo should remain on disk");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Proves tombstones are actually dropped, not just correctly shadowed:
+    /// after compacting everything, there should be no trace of the key
+    /// left at all, not even a tombstone record.
+    #[test]
+    fn compact_drops_tombstones_entirely() {
+        let dir = temp_db_dir("compact_tombstone");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.delete(b"foo").unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+
+        assert_eq!(db.sstable_count(), 1);
+        assert_eq!(db.get(b"foo").unwrap(), None);
+
+        let entries: Vec<_> =
+            db.sstables[0].iter().unwrap().collect::<io::Result<Vec<_>>>().unwrap();
+        assert!(entries.is_empty(), "tombstone should have been dropped, not just shadowed");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compact_removes_old_sstable_files_from_disk() {
+        let dir = temp_db_dir("compact_cleanup");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"1".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"bar".to_vec(), b"2".to_vec()).unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+
+        assert!(!dir.join("000000.sst").exists(), "old sstable data file should be deleted");
+        assert!(!dir.join("000000.bloom").exists(), "old bloom sidecar should be deleted");
+        assert!(!dir.join("000001.sst").exists(), "old sstable data file should be deleted");
+        assert!(!dir.join("000001.bloom").exists(), "old bloom sidecar should be deleted");
+        assert!(dir.join("000002.sst").exists(), "merged sstable should exist");
 
         fs::remove_dir_all(&dir).unwrap();
     }

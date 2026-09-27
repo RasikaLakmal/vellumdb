@@ -15,7 +15,9 @@ fn main() {
     let stdin = io::stdin();
 
     println!("vellumdb 0.1.0 (dir: {dir}, {} sstables on disk)", db.sstable_count());
-    println!("commands: put <key> <value> | get <key> | delete <key> | scan | flush | exit");
+    println!(
+        "commands: put <key> <value> | get <key> | delete <key> | scan | flush | compact | exit"
+    );
 
     loop {
         print!("vellum> ");
@@ -74,6 +76,10 @@ fn main() {
                 }
             }
             "flush" => match db.flush() {
+                Ok(()) => println!("ok ({} sstables on disk)", db.sstable_count()),
+                Err(e) => println!("error: {e}"),
+            },
+            "compact" => match db.compact() {
                 Ok(()) => println!("ok ({} sstables on disk)", db.sstable_count()),
                 Err(e) => println!("error: {e}"),
             },
