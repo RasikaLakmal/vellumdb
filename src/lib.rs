@@ -1,6 +1,7 @@
 mod bloom;
 mod encoding;
 mod entry;
+mod manifest;
 mod sstable;
 mod wal;
 
@@ -10,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use entry::{Entry, EntryValue};
+use manifest::Manifest;
 use sstable::SsTable;
 use wal::Wal;
 
@@ -39,7 +41,9 @@ pub struct Db {
     /// correctness yet, current recency is already handled by "memtable
     /// wins, then newest sstable wins". It becomes load-bearing once
     /// compaction needs to merge sstables with overlapping key ranges and
-    /// once MVCC (milestone 11) needs point-in-time snapshots.
+    /// once MVCC (milestone 11) needs point-in-time snapshots. Recovered on
+    /// open from the manifest's last committed value plus whatever the WAL
+    /// replay pushes it forward by.
     next_seq: u64,
 }
 
@@ -62,44 +66,35 @@ impl Db {
         }
     }
 
-    /// Open (or create) a database directory at `dir`. Existing SSTables are
-    /// picked up in order, then the WAL is replayed on top of them to
-    /// restore anything written since the last flush. The next sequence
-    /// number is recovered by scanning every sstable and the WAL for the
-    /// highest one seen, this is an O(all data on disk) startup cost that
-    /// milestone 6's manifest will remove by storing it durably instead.
+    /// Open (or create) a database directory at `dir`. Only SSTables listed
+    /// in the manifest are trusted, an `.sst` file sitting in the directory
+    /// but not named there is an orphan from an interrupted flush (the data
+    /// file got written but the process died before the manifest committed
+    /// it) and is silently ignored rather than treated as live data. The WAL
+    /// is then replayed on top to restore anything written since the last
+    /// flush.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
 
-        let mut sstable_files: Vec<(u64, PathBuf)> = fs::read_dir(dir)?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                let id: u64 = path.file_stem()?.to_str()?.parse().ok()?;
-                (path.extension()?.to_str()? == "sst").then_some((id, path))
-            })
-            .collect();
-        sstable_files.sort_by_key(|(id, _)| *id);
-
-        let next_sstable_id = sstable_files.last().map(|(id, _)| id + 1).unwrap_or(0);
-        let sstables: Vec<SsTable> = sstable_files
-            .into_iter()
-            .map(|(_, path)| SsTable::open(path))
+        let manifest = Manifest::load(dir)?;
+        let next_sstable_id = manifest.sstable_ids.iter().max().map_or(0, |id| id + 1);
+        let sstables: Vec<SsTable> = manifest
+            .sstable_ids
+            .iter()
+            .map(|&id| SsTable::open(id, sstable_path(dir, id)))
             .collect::<io::Result<Vec<_>>>()?;
 
-        let mut max_seq: Option<u64> = None;
-        for sstable in &sstables {
-            for item in sstable.iter()? {
-                let (_, entry) = item?;
-                max_seq = Some(max_seq.map_or(entry.seq, |m| m.max(entry.seq)));
-            }
-        }
-
+        // The manifest's next_seq is a floor as of the last committed
+        // flush, replaying the WAL (only the tail written since then, since
+        // rotation doesn't exist until milestone 10) pushes it forward to
+        // cover anything written after. This is what lets open() skip
+        // scanning every sstable's contents just to recover the counter.
+        let mut next_seq = manifest.next_seq;
         let wal_path = dir.join("wal.log");
         let mut data = BTreeMap::new();
         for record in Wal::replay(&wal_path)? {
-            max_seq = Some(max_seq.map_or(record.entry.seq, |m| m.max(record.entry.seq)));
+            next_seq = next_seq.max(record.entry.seq + 1);
             data.insert(record.key, record.entry);
         }
         let memtable_size_bytes = data.iter().map(|(k, e)| entry_size(k, e)).sum();
@@ -112,7 +107,7 @@ impl Db {
             dir: Some(dir.to_path_buf()),
             sstables,
             next_sstable_id,
-            next_seq: max_seq.map_or(0, |m| m + 1),
+            next_seq,
         })
     }
 
@@ -212,25 +207,40 @@ impl Db {
     }
 
     /// Write the current memtable (including any tombstones) to a new
-    /// SSTable file and clear it. No-op if this database has no backing
-    /// directory (`Db::new()`).
+    /// SSTable file, then atomically install a manifest that references it,
+    /// only then is it actually part of the database. If the process dies
+    /// between those two steps, the new `.sst` file is left on disk but the
+    /// manifest still points at the old state, so the next `open()` ignores
+    /// it as an orphan and recovers the pre-flush state from the WAL
+    /// instead, never a mix of the two. No-op if this database has no
+    /// backing directory (`Db::new()`).
     pub fn flush(&mut self) -> io::Result<()> {
-        let Some(dir) = &self.dir else {
+        let Some(dir) = self.dir.clone() else {
             return Ok(());
         };
         if self.data.is_empty() {
             return Ok(());
         }
 
-        let path = dir.join(format!("{:06}.sst", self.next_sstable_id));
-        let sstable = SsTable::write(path, self.data.iter(), self.data.len())?;
+        let id = self.next_sstable_id;
+        let sstable = SsTable::write(id, sstable_path(&dir, id), self.data.iter(), self.data.len())?;
+
+        let manifest = Manifest {
+            sstable_ids: self.sstables.iter().map(SsTable::id).chain([id]).collect(),
+            next_seq: self.next_seq,
+        };
+        manifest.save(&dir)?;
+
         self.sstables.push(sstable);
         self.next_sstable_id += 1;
-
         self.data.clear();
         self.memtable_size_bytes = 0;
         Ok(())
     }
+}
+
+fn sstable_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{id:06}.sst"))
 }
 
 fn entry_size(key: &[u8], entry: &Entry) -> usize {
@@ -445,6 +455,35 @@ mod tests {
 
         assert_eq!(db.get(b"definitely-not-a-key").unwrap(), None);
         assert!(db.get(b"foo").is_err(), "bloom said maybe, so it should have tried the gone file");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// This is the manifest's actual reason for existing: simulate a crash
+    /// that happens between an sstable's data file being written and the
+    /// manifest being updated to reference it, by fabricating a well-formed
+    /// orphan sstable directly, bypassing `Db::flush` (and therefore the
+    /// manifest) entirely. Reopening must ignore it and recover the
+    /// pre-flush state purely from the WAL, never a mix of the two.
+    #[test]
+    fn orphaned_sstable_from_a_crashed_flush_is_ignored_on_reopen() {
+        let dir = temp_db_dir("orphan_sstable");
+
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+            // durable in the wal, nothing flushed yet
+        }
+
+        let orphan_key = b"should-not-be-visible".to_vec();
+        let orphan_entry = Entry { seq: 999, value: EntryValue::Value(b"orphan".to_vec()) };
+        let orphan_data = BTreeMap::from([(orphan_key.clone(), orphan_entry)]);
+        SsTable::write(99, dir.join("000099.sst"), orphan_data.iter(), 1).unwrap();
+
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.sstable_count(), 0, "orphan isn't in the manifest, so it's not active");
+        assert_eq!(db.get(b"foo").unwrap(), Some(b"bar".to_vec()), "recovered via wal replay");
+        assert_eq!(db.get(&orphan_key).unwrap(), None, "orphan's data was never committed");
 
         fs::remove_dir_all(&dir).unwrap();
     }

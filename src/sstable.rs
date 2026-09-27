@@ -15,6 +15,7 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// file entirely for keys that definitely aren't in it. No other index yet,
 /// a key that might be present still costs a linear scan.
 pub struct SsTable {
+    id: u64,
     path: PathBuf,
     bloom: BloomFilter,
 }
@@ -23,8 +24,11 @@ impl SsTable {
     /// Write `entries` (must already be sorted by key, as memtable iteration
     /// guarantees) to a new SSTable file at `path`, plus its Bloom filter
     /// sidecar. `expected_items` sizes the filter, it should be the number
-    /// of entries about to be written.
+    /// of entries about to be written. Note this alone doesn't make the
+    /// sstable part of the database, that only happens once the manifest is
+    /// updated to reference `id`, see `manifest.rs`.
     pub fn write<'a>(
+        id: u64,
         path: impl AsRef<Path>,
         entries: impl Iterator<Item = (&'a Vec<u8>, &'a Entry)>,
         expected_items: usize,
@@ -48,13 +52,17 @@ impl SsTable {
         writer.flush()?;
         bloom.write(bloom_path(&path))?;
 
-        Ok(SsTable { path, bloom })
+        Ok(SsTable { id, path, bloom })
     }
 
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(id: u64, path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let bloom = BloomFilter::load(bloom_path(&path))?;
-        Ok(SsTable { path, bloom })
+        Ok(SsTable { id, path, bloom })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Checks the Bloom filter first, a `false` there means the key is
