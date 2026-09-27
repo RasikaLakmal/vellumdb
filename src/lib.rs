@@ -1,4 +1,5 @@
 mod encoding;
+mod entry;
 mod sstable;
 mod wal;
 
@@ -7,8 +8,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use entry::{Entry, EntryValue};
 use sstable::SsTable;
-use wal::{Wal, WalRecord};
+use wal::Wal;
 
 /// Memtable flushes to a new SSTable once its approximate size crosses this.
 /// Small on purpose so it's easy to trigger and observe without huge inputs.
@@ -19,16 +21,25 @@ const FLUSH_THRESHOLD_BYTES: usize = 1024;
 /// with a data directory: a WAL for durability plus zero or more SSTables
 /// that earlier memtable flushes produced.
 ///
-/// Reads check the memtable first, then SSTables newest to oldest, so a
-/// flushed key is still found transparently through `get`.
+/// Reads check the memtable first, then SSTables newest to oldest. Deletes
+/// write a tombstone rather than just removing the key, so a flushed key
+/// stays deleted even once the memtable that originally held the delete has
+/// been cleared: the tombstone travels forward through future flushes until
+/// compaction (milestone 7) can eventually drop it for good.
 pub struct Db {
-    data: BTreeMap<Vec<u8>, Vec<u8>>,
+    data: BTreeMap<Vec<u8>, Entry>,
     memtable_size_bytes: usize,
     wal: Option<Wal>,
     dir: Option<PathBuf>,
     /// Oldest first. Reads walk this in reverse so the newest flush wins.
     sstables: Vec<SsTable>,
     next_sstable_id: u64,
+    /// Monotonic counter stamped onto every entry. Not load-bearing for
+    /// correctness yet, current recency is already handled by "memtable
+    /// wins, then newest sstable wins". It becomes load-bearing once
+    /// compaction needs to merge sstables with overlapping key ranges and
+    /// once MVCC (milestone 11) needs point-in-time snapshots.
+    next_seq: u64,
 }
 
 impl Default for Db {
@@ -46,12 +57,16 @@ impl Db {
             dir: None,
             sstables: Vec::new(),
             next_sstable_id: 0,
+            next_seq: 0,
         }
     }
 
     /// Open (or create) a database directory at `dir`. Existing SSTables are
     /// picked up in order, then the WAL is replayed on top of them to
-    /// restore anything written since the last flush.
+    /// restore anything written since the last flush. The next sequence
+    /// number is recovered by scanning every sstable and the WAL for the
+    /// highest one seen, this is an O(all data on disk) startup cost that
+    /// milestone 6's manifest will remove by storing it durably instead.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
@@ -70,19 +85,21 @@ impl Db {
         let sstables: Vec<SsTable> =
             sstable_files.into_iter().map(|(_, path)| SsTable::open(path)).collect();
 
+        let mut max_seq: Option<u64> = None;
+        for sstable in &sstables {
+            for item in sstable.iter()? {
+                let (_, entry) = item?;
+                max_seq = Some(max_seq.map_or(entry.seq, |m| m.max(entry.seq)));
+            }
+        }
+
         let wal_path = dir.join("wal.log");
         let mut data = BTreeMap::new();
         for record in Wal::replay(&wal_path)? {
-            match record {
-                WalRecord::Put { key, value } => {
-                    data.insert(key, value);
-                }
-                WalRecord::Delete { key } => {
-                    data.remove(&key);
-                }
-            }
+            max_seq = Some(max_seq.map_or(record.entry.seq, |m| m.max(record.entry.seq)));
+            data.insert(record.key, record.entry);
         }
-        let memtable_size_bytes = data.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let memtable_size_bytes = data.iter().map(|(k, e)| entry_size(k, e)).sum();
 
         let wal = Wal::open(&wal_path)?;
         Ok(Db {
@@ -92,50 +109,75 @@ impl Db {
             dir: Some(dir.to_path_buf()),
             sstables,
             next_sstable_id,
+            next_seq: max_seq.map_or(0, |m| m + 1),
         })
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
         if let Some(wal) = &mut self.wal {
-            wal.append_put(&key, &value)?;
+            wal.append_put(seq, &key, &value)?;
         }
-        let old_size = self.data.get(&key).map_or(0, |old| key.len() + old.len());
-        let new_size = key.len() + value.len();
-        self.memtable_size_bytes = self.memtable_size_bytes - old_size + new_size;
-        self.data.insert(key, value);
+
+        let entry = Entry { seq, value: EntryValue::Value(value) };
+        let old_size = self.data.get(&key).map_or(0, |old| entry_size(&key, old));
+        let new_size = entry_size(&key, &entry);
+        self.memtable_size_bytes = self.memtable_size_bytes.saturating_sub(old_size) + new_size;
+        self.data.insert(key, entry);
+
         self.maybe_flush()?;
         Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if let Some(value) = self.data.get(key) {
-            return Ok(Some(value.clone()));
+        if let Some(entry) = self.data.get(key) {
+            return Ok(match &entry.value {
+                EntryValue::Value(v) => Some(v.clone()),
+                EntryValue::Tombstone => None,
+            });
         }
         for sstable in self.sstables.iter().rev() {
-            if let Some(value) = sstable.get(key)? {
-                return Ok(Some(value));
+            if let Some(entry) = sstable.get(key)? {
+                return Ok(match entry.value {
+                    EntryValue::Value(v) => Some(v),
+                    EntryValue::Tombstone => None,
+                });
             }
         }
         Ok(None)
     }
 
-    /// Deletes the key from the memtable. Known limitation: if the key was
-    /// already flushed to an SSTable, this currently does nothing to that
-    /// on-disk copy, so `get` will still find the old value there. Fixed by
-    /// tombstones in milestone 4, see notes/vellumdb/04-tombstones.md.
+    /// Writes a tombstone for the key instead of just removing it, so the
+    /// delete survives being carried forward across a flush: even once an
+    /// older SSTable still holds a stale value for this key, the tombstone
+    /// in front of it makes `get` report not-found instead of falling
+    /// through to the stale copy.
+    ///
+    /// The return value reflects whether the key existed anywhere (memtable
+    /// or any sstable), which costs a full lookup on every delete. That cost
+    /// is exactly what Bloom filters (milestone 5) exist to cut down.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
+        let existed = self.get(key)?.is_some();
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
         if let Some(wal) = &mut self.wal {
-            wal.append_delete(key)?;
+            wal.append_tombstone(seq, key)?;
         }
-        match self.data.remove(key) {
-            Some(old) => {
-                self.memtable_size_bytes = self.memtable_size_bytes.saturating_sub(key.len() + old.len());
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+
+        let entry = Entry { seq, value: EntryValue::Tombstone };
+        let old_size = self.data.get(key).map_or(0, |old| entry_size(key, old));
+        let new_size = entry_size(key, &entry);
+        self.memtable_size_bytes = self.memtable_size_bytes.saturating_sub(old_size) + new_size;
+        self.data.insert(key.to_vec(), entry);
+
+        self.maybe_flush()?;
+        Ok(existed)
     }
 
+    /// Number of entries in the memtable, including tombstones not yet
+    /// flushed. Not the same as "number of live keys".
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -144,11 +186,15 @@ impl Db {
         self.data.is_empty()
     }
 
-    /// Iterate the memtable's entries in key order. Only source is the
-    /// memtable for now, this becomes a merge iterator across memtable +
-    /// SSTables at milestone 8.
+    /// Iterate the memtable's live entries in key order, tombstones are
+    /// filtered out since a scan should only show what's actually there.
+    /// Only source is the memtable for now, this becomes a merge iterator
+    /// across memtable + SSTables at milestone 8.
     pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
-        self.data.iter()
+        self.data.iter().filter_map(|(k, e)| match &e.value {
+            EntryValue::Value(v) => Some((k, v)),
+            EntryValue::Tombstone => None,
+        })
     }
 
     pub fn sstable_count(&self) -> usize {
@@ -162,8 +208,9 @@ impl Db {
         Ok(())
     }
 
-    /// Write the current memtable to a new SSTable file and clear it.
-    /// No-op if this database has no backing directory (`Db::new()`).
+    /// Write the current memtable (including any tombstones) to a new
+    /// SSTable file and clear it. No-op if this database has no backing
+    /// directory (`Db::new()`).
     pub fn flush(&mut self) -> io::Result<()> {
         let Some(dir) = &self.dir else {
             return Ok(());
@@ -181,6 +228,14 @@ impl Db {
         self.memtable_size_bytes = 0;
         Ok(())
     }
+}
+
+fn entry_size(key: &[u8], entry: &Entry) -> usize {
+    key.len()
+        + match &entry.value {
+            EntryValue::Value(v) => v.len(),
+            EntryValue::Tombstone => 0,
+        }
 }
 
 #[cfg(test)]
@@ -231,6 +286,17 @@ mod tests {
 
         let keys: Vec<&[u8]> = db.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(keys, vec![b"alpha".as_slice(), b"bravo".as_slice(), b"charlie".as_slice()]);
+    }
+
+    #[test]
+    fn iter_skips_tombstones() {
+        let mut db = Db::new();
+        db.put(b"alpha".to_vec(), b"1".to_vec()).unwrap();
+        db.put(b"bravo".to_vec(), b"2".to_vec()).unwrap();
+        db.delete(b"alpha").unwrap();
+
+        let keys: Vec<&[u8]> = db.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![b"bravo".as_slice()]);
     }
 
     fn temp_db_dir(name: &str) -> PathBuf {
@@ -319,12 +385,12 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Documents a known gap, not a desired behavior: deleting a key that's
-    /// already been flushed to an SSTable currently has no effect, because
-    /// delete only touches the memtable. `get` still finds the stale value
-    /// on disk. This gets fixed by tombstones in milestone 4.
+    /// This is the fix for the gap milestone 3 documented and deliberately
+    /// left open: deleting a key already flushed to an SSTable now works,
+    /// because delete writes a tombstone into the (empty) memtable, and that
+    /// tombstone shadows the stale value sitting in the older sstable.
     #[test]
-    fn known_limitation_delete_after_flush_does_not_take_effect_yet() {
+    fn delete_after_flush_now_takes_effect() {
         let dir = temp_db_dir("delete_after_flush");
         let mut db = Db::open(&dir).unwrap();
 
@@ -332,12 +398,28 @@ mod tests {
         db.flush().unwrap();
 
         let deleted = db.delete(b"foo").unwrap();
-        assert!(!deleted, "delete reports not-found since the key isn't in the memtable");
-        assert_eq!(
-            db.get(b"foo").unwrap(),
-            Some(b"bar".to_vec()),
-            "stale value is still served from the sstable, this is the gap tombstones close"
-        );
+        assert!(deleted, "key exists in the sstable, so delete should report it existed");
+        assert_eq!(db.get(b"foo").unwrap(), None, "tombstone in the memtable shadows the sstable");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The tombstone itself must also survive being flushed: once it's
+    /// written out to a newer sstable, it still has to shadow the stale
+    /// value sitting in an older one.
+    #[test]
+    fn tombstone_survives_flush_and_still_shadows_older_sstable() {
+        let dir = temp_db_dir("tombstone_flush");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        db.flush().unwrap();
+
+        db.delete(b"foo").unwrap();
+        db.flush().unwrap();
+
+        assert_eq!(db.sstable_count(), 2);
+        assert_eq!(db.get(b"foo").unwrap(), None);
 
         fs::remove_dir_all(&dir).unwrap();
     }
