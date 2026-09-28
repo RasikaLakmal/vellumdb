@@ -66,15 +66,24 @@ fn main() {
                 },
                 None => println!("usage: delete <key>"),
             },
-            "scan" => {
-                for (key, value) in db.iter() {
-                    println!(
-                        "{}={}",
-                        String::from_utf8_lossy(key),
-                        String::from_utf8_lossy(value)
-                    );
+            "scan" => match db.range() {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok((key, value)) => println!(
+                                "{}={}",
+                                String::from_utf8_lossy(&key),
+                                String::from_utf8_lossy(&value)
+                            ),
+                            Err(e) => {
+                                println!("error: {e}");
+                                break;
+                            }
+                        }
+                    }
                 }
-            }
+                Err(e) => println!("error: {e}"),
+            },
             "flush" => match db.flush() {
                 Ok(()) => println!("ok ({} sstables on disk)", db.sstable_count()),
                 Err(e) => println!("error: {e}"),

@@ -1,1 +1,9 @@
 /target
+
+# local db data directories created by running the repl
+/vellum-data
+*.wal
+*.sst
+*.bloom
+MANIFEST
+MANIFEST.tmp

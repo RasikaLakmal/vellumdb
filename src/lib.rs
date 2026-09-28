@@ -2,6 +2,7 @@ mod bloom;
 mod encoding;
 mod entry;
 mod manifest;
+mod merge;
 mod sstable;
 mod wal;
 
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use entry::{Entry, EntryValue};
 use manifest::Manifest;
+use merge::{MergeIter, SourceIter};
 use sstable::SsTable;
 use wal::Wal;
 
@@ -184,15 +186,19 @@ impl Db {
         self.data.is_empty()
     }
 
-    /// Iterate the memtable's live entries in key order, tombstones are
-    /// filtered out since a scan should only show what's actually there.
-    /// Only source is the memtable for now, this becomes a merge iterator
-    /// across memtable + SSTables at milestone 8.
-    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
-        self.data.iter().filter_map(|(k, e)| match &e.value {
-            EntryValue::Value(v) => Some((k, v)),
-            EntryValue::Tombstone => None,
-        })
+    /// Every live key in the database in ascending order: memtable and all
+    /// SSTables merged together with recency resolved correctly and
+    /// tombstoned keys dropped entirely. This is a full scan, not a bounded
+    /// range query, there's no index yet to make seeking to a start key
+    /// cheap, and nothing needs bounded scans yet either, that's a natural,
+    /// cheap extension to add once something actually calls for it.
+    pub fn range(&self) -> io::Result<MergeIter<'_>> {
+        let mut sources: Vec<SourceIter<'_>> = Vec::with_capacity(self.sstables.len() + 1);
+        for sstable in &self.sstables {
+            sources.push(Box::new(sstable.iter()?));
+        }
+        sources.push(Box::new(self.data.iter().map(|(k, e)| Ok((k.clone(), e.clone())))));
+        Ok(MergeIter::new(sources))
     }
 
     pub fn sstable_count(&self) -> usize {
@@ -247,9 +253,14 @@ impl Db {
     /// flush and compaction stay separate operations.
     ///
     /// Loads every sstable's contents into memory to de-duplicate rather
-    /// than streaming a merge, that's an intentional simplification for
-    /// now. Milestone 8's merge iterator is the natural thing to swap this
-    /// to if benchmarking (milestone 13) ever shows it's a real bottleneck.
+    /// than streaming a merge. `merge::MergeIter` (milestone 8) turned out
+    /// not to be a drop-in replacement for this: it's shaped for reads, so
+    /// it drops tombstones and discards sequence numbers, while compaction
+    /// needs to keep `Entry` (seq included) intact for every surviving key.
+    /// Streaming this properly would need a merge that yields full `Entry`
+    /// values and leaves the tombstone/dedup decision to the caller, a
+    /// reasonable future generalization if benchmarking (milestone 13)
+    /// ever shows this eager approach is a real bottleneck.
     ///
     /// Installs the merged result the same way `flush` installs a new
     /// sstable: write the file, then atomically swap in a manifest that
@@ -349,26 +360,78 @@ mod tests {
         assert!(!db.delete(b"missing").unwrap());
     }
 
+    fn collect_range(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+        db.range().unwrap().collect::<io::Result<Vec<_>>>().unwrap()
+    }
+
     #[test]
-    fn iter_returns_entries_in_key_order() {
+    fn range_returns_entries_in_key_order() {
         let mut db = Db::new();
         db.put(b"charlie".to_vec(), b"3".to_vec()).unwrap();
         db.put(b"alpha".to_vec(), b"1".to_vec()).unwrap();
         db.put(b"bravo".to_vec(), b"2".to_vec()).unwrap();
 
-        let keys: Vec<&[u8]> = db.iter().map(|(k, _)| k.as_slice()).collect();
-        assert_eq!(keys, vec![b"alpha".as_slice(), b"bravo".as_slice(), b"charlie".as_slice()]);
+        let keys: Vec<Vec<u8>> = collect_range(&db).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()]);
     }
 
     #[test]
-    fn iter_skips_tombstones() {
+    fn range_skips_tombstones() {
         let mut db = Db::new();
         db.put(b"alpha".to_vec(), b"1".to_vec()).unwrap();
         db.put(b"bravo".to_vec(), b"2".to_vec()).unwrap();
         db.delete(b"alpha").unwrap();
 
-        let keys: Vec<&[u8]> = db.iter().map(|(k, _)| k.as_slice()).collect();
-        assert_eq!(keys, vec![b"bravo".as_slice()]);
+        let keys: Vec<Vec<u8>> = collect_range(&db).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"bravo".to_vec()]);
+    }
+
+    /// The actual point of milestone 8: a full scan has to merge the
+    /// memtable and every SSTable together, not just show whichever one
+    /// happens to hold a given key.
+    #[test]
+    fn range_merges_memtable_and_sstables() {
+        let dir = temp_db_dir("range_merge");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"alpha".to_vec(), b"1".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"bravo".to_vec(), b"2".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"charlie".to_vec(), b"3".to_vec()).unwrap(); // stays in the memtable
+
+        assert_eq!(
+            collect_range(&db),
+            vec![
+                (b"alpha".to_vec(), b"1".to_vec()),
+                (b"bravo".to_vec(), b"2".to_vec()),
+                (b"charlie".to_vec(), b"3".to_vec()),
+            ]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Recency has to be resolved across sources too: a newer value in the
+    /// memtable must win over a stale copy still sitting in an sstable, and
+    /// a tombstone anywhere in the chain must suppress an older sstable's
+    /// value for that key rather than both showing up.
+    #[test]
+    fn range_resolves_recency_across_sources() {
+        let dir = temp_db_dir("range_recency");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"v1".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"foo".to_vec(), b"v2".to_vec()).unwrap(); // newer, still in memtable
+
+        db.put(b"bar".to_vec(), b"hello".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.delete(b"bar").unwrap(); // tombstone, still in memtable
+
+        assert_eq!(collect_range(&db), vec![(b"foo".to_vec(), b"v2".to_vec())]);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn temp_db_dir(name: &str) -> PathBuf {
