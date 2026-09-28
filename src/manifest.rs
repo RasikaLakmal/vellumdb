@@ -76,3 +76,62 @@ impl Manifest {
 fn manifest_path(dir: &Path) -> PathBuf {
     dir.join("MANIFEST")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("vellumdb_manifest_test_{}_{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_on_missing_manifest_is_empty() {
+        let dir = temp_dir("missing");
+
+        let m = Manifest::load(&dir).unwrap();
+        assert!(m.sstable_ids.is_empty());
+        assert_eq!(m.next_seq, 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = temp_dir("roundtrip");
+
+        let m = Manifest { sstable_ids: vec![0, 1, 2], next_seq: 42 };
+        m.save(&dir).unwrap();
+
+        let loaded = Manifest::load(&dir).unwrap();
+        assert_eq!(loaded.sstable_ids, vec![0, 1, 2]);
+        assert_eq!(loaded.next_seq, 42);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Proves the atomicity claim directly at this layer instead of only
+    /// through the higher-level orphan-sstable test: a stray `.tmp` file
+    /// left behind by an interrupted save (the process died after writing
+    /// it but before the rename that would make it real) must never be
+    /// picked up as if it were the committed manifest.
+    #[test]
+    fn stray_tmp_file_without_a_completed_rename_is_ignored() {
+        let dir = temp_dir("stray_tmp");
+
+        let committed = Manifest { sstable_ids: vec![99], next_seq: 999 };
+        committed.save(&dir).unwrap();
+        // Simulate a crash mid-save on a later attempt: a fresh tmp file
+        // sitting next to the already-committed manifest, never renamed in.
+        fs::write(dir.join("MANIFEST.tmp"), b"not a real manifest").unwrap();
+
+        let loaded = Manifest::load(&dir).unwrap();
+        assert_eq!(loaded.sstable_ids, vec![99], "must load the last completed save, not the tmp");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}

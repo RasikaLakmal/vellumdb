@@ -1,8 +1,10 @@
 /target
 
-# local db data directories created by running the repl
-/vellum-data
-*.wal
+# files created by running the repl against any local test database
+# directory, regardless of what it's named (vellum-data, try-crash, ...):
+# once these are ignored, a directory containing only these has nothing
+# trackable left in it and git stops listing it entirely.
+wal.log
 *.sst
 *.bloom
 MANIFEST
