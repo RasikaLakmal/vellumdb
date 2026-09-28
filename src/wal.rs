@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::encoding::{read_bytes, read_frame, write_bytes, write_frame, Frame};
 use crate::entry::{Entry, EntryValue};
@@ -15,12 +15,14 @@ pub struct WalRecord {
 
 pub struct Wal {
     file: File,
+    path: PathBuf,
 }
 
 impl Wal {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Wal { file })
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Wal { file, path })
     }
 
     pub fn append_put(&mut self, seq: u64, key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -40,6 +42,34 @@ impl Wal {
         write_bytes(&mut payload, key)?;
         write_frame(&mut self.file, &payload)?;
         self.file.sync_data()
+    }
+
+    /// Truncates the log to empty. Only safe to call once every record
+    /// currently in it corresponds to data that's now durably reflected in
+    /// an sstable, i.e. right after a successful flush's manifest commit,
+    /// never before it.
+    ///
+    /// Goes through a fresh handle rather than `self.file.set_len(0)`: on
+    /// Windows, a handle opened in append-only mode (`FILE_APPEND_DATA`)
+    /// doesn't carry the access right `SetEndOfFile` needs, so resizing it
+    /// directly fails with a permission error, Unix's `O_APPEND` doesn't
+    /// have this restriction, which is exactly the kind of platform gap
+    /// that's easy to miss without actually running this on Windows.
+    /// `File::create` opens with write access and truncates by construction,
+    /// and since it's a second handle to the same underlying file, `self.
+    /// file` sees the truncation too, appends after this still land at the
+    /// new (zero) end of file with no explicit seek needed.
+    ///
+    /// No fsync here: if the process crashes between the manifest commit
+    /// and this call, the WAL still holds records for data that's already
+    /// safely on disk, so the next `open()` just redundantly replays them
+    /// into an otherwise-empty memtable again, exactly what happened before
+    /// rotation existed. That's wasted startup work, not data loss, so a
+    /// crash losing this particular write costs nothing beyond delaying
+    /// rotation by one more flush cycle.
+    pub fn truncate(&mut self) -> io::Result<()> {
+        File::create(&self.path)?;
+        Ok(())
     }
 
     /// Read every record currently in the log, in order, to rebuild state on

@@ -88,10 +88,12 @@ impl Db {
             .collect::<io::Result<Vec<_>>>()?;
 
         // The manifest's next_seq is a floor as of the last committed
-        // flush, replaying the WAL (only the tail written since then, since
-        // rotation doesn't exist until milestone 10) pushes it forward to
-        // cover anything written after. This is what lets open() skip
-        // scanning every sstable's contents just to recover the counter.
+        // flush, replaying the WAL (only the tail written since then, the
+        // rest was rotated away in flush()) pushes it forward to cover
+        // anything written after. This is what lets open() skip scanning
+        // every sstable's contents just to recover the counter, and what
+        // keeps replay bounded by "writes since the last flush" rather than
+        // "writes since the database was created".
         let mut next_seq = manifest.next_seq;
         let wal_path = dir.join("wal.log");
         let mut data = BTreeMap::new();
@@ -218,8 +220,15 @@ impl Db {
     /// between those two steps, the new `.sst` file is left on disk but the
     /// manifest still points at the old state, so the next `open()` ignores
     /// it as an orphan and recovers the pre-flush state from the WAL
-    /// instead, never a mix of the two. No-op if this database has no
-    /// backing directory (`Db::new()`).
+    /// instead, never a mix of the two.
+    ///
+    /// Once the manifest commit succeeds, every record currently in the WAL
+    /// is redundant (it's now durably reflected in this or an earlier
+    /// sstable), so the WAL is rotated (truncated to empty) before
+    /// returning. This is what keeps `open()`'s replay bounded by "writes
+    /// since the last flush" instead of letting the WAL grow forever across
+    /// the database's whole lifetime. No-op if this database has no backing
+    /// directory (`Db::new()`).
     pub fn flush(&mut self) -> io::Result<()> {
         let Some(dir) = self.dir.clone() else {
             return Ok(());
@@ -236,6 +245,10 @@ impl Db {
             next_seq: self.next_seq,
         };
         manifest.save(&dir)?;
+
+        if let Some(wal) = &mut self.wal {
+            wal.truncate()?;
+        }
 
         self.sstables.push(sstable);
         self.next_sstable_id += 1;
@@ -692,6 +705,69 @@ mod tests {
         let entries: Vec<_> =
             db.sstables[0].iter().unwrap().collect::<io::Result<Vec<_>>>().unwrap();
         assert!(entries.is_empty(), "tombstone should have been dropped, not just shadowed");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn flush_rotates_the_wal_to_empty() {
+        let dir = temp_db_dir("wal_rotate");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        assert!(fs::metadata(dir.join("wal.log")).unwrap().len() > 0);
+
+        db.flush().unwrap();
+        assert_eq!(
+            fs::metadata(dir.join("wal.log")).unwrap().len(),
+            0,
+            "wal should be empty once its records are durably reflected in the new sstable"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The actual point of rotation: without it the wal accumulates every
+    /// record from every flush across the database's whole lifetime. With
+    /// it, only writes since the *last* flush are ever sitting in the wal.
+    #[test]
+    fn wal_does_not_accumulate_records_across_multiple_flushes() {
+        let dir = temp_db_dir("wal_bounded");
+        let mut db = Db::open(&dir).unwrap();
+
+        for i in 0..5 {
+            db.put(format!("key-{i}").into_bytes(), b"v".to_vec()).unwrap();
+            db.flush().unwrap();
+            assert_eq!(
+                fs::metadata(dir.join("wal.log")).unwrap().len(),
+                0,
+                "wal should be rotated away after every single flush, not just the first"
+            );
+        }
+
+        // all 5 keys should still be correct, purely from the sstables now
+        for i in 0..5 {
+            assert_eq!(db.get(format!("key-{i}").as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Reopening after a flush should recover cleanly with nothing left for
+    /// the (now-rotated, empty) wal to contribute.
+    #[test]
+    fn reopen_after_flush_needs_no_wal_replay() {
+        let dir = temp_db_dir("reopen_after_flush");
+
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+            db.flush().unwrap();
+        }
+
+        assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 0);
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.get(b"foo").unwrap(), Some(b"bar".to_vec()));
 
         fs::remove_dir_all(&dir).unwrap();
     }
