@@ -15,6 +15,7 @@ use std::path::Path;
 /// The k hash positions themselves come from two real hashes combined via
 /// double hashing (Kirsch-Mitzenmacher), which avoids needing k independent
 /// hash functions.
+#[derive(Clone)]
 pub struct BloomFilter {
     bits: Vec<u64>,
     num_bits: usize,

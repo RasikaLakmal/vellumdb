@@ -3,14 +3,22 @@ use std::io::{self, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use crate::encoding::{read_bytes, read_frame, write_bytes, write_frame, Frame};
-use crate::entry::{Entry, EntryValue};
 
 const TAG_PUT: u8 = 0;
 const TAG_TOMBSTONE: u8 = 1;
 
+/// One write within a batch. A lone `put`/`delete` is just a batch of one
+/// of these, there's no separate single-operation wire format anymore.
+pub enum WalOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+/// Every operation from one `Wal::append` call, sharing the one sequence
+/// number that call was stamped with.
 pub struct WalRecord {
-    pub key: Vec<u8>,
-    pub entry: Entry,
+    pub seq: u64,
+    pub ops: Vec<WalOp>,
 }
 
 pub struct Wal {
@@ -25,21 +33,29 @@ impl Wal {
         Ok(Wal { file, path })
     }
 
-    pub fn append_put(&mut self, seq: u64, key: &[u8], value: &[u8]) -> io::Result<()> {
+    /// Writes every op in `ops` as one checksummed frame (milestone 9's
+    /// `write_frame`), that's what makes a multi-key batch atomic for free:
+    /// a torn write during it loses the entire frame, so either every op in
+    /// the batch is recovered on replay or none of them are, the same
+    /// guarantee a single record already had, just extended to cover
+    /// several operations sharing one sequence number instead of one.
+    pub fn append(&mut self, seq: u64, ops: &[WalOp]) -> io::Result<()> {
         let mut payload = Vec::new();
-        payload.push(TAG_PUT);
         payload.extend_from_slice(&seq.to_le_bytes());
-        write_bytes(&mut payload, key)?;
-        write_bytes(&mut payload, value)?;
-        write_frame(&mut self.file, &payload)?;
-        self.file.sync_data()
-    }
-
-    pub fn append_tombstone(&mut self, seq: u64, key: &[u8]) -> io::Result<()> {
-        let mut payload = Vec::new();
-        payload.push(TAG_TOMBSTONE);
-        payload.extend_from_slice(&seq.to_le_bytes());
-        write_bytes(&mut payload, key)?;
+        payload.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+        for op in ops {
+            match op {
+                WalOp::Put(key, value) => {
+                    payload.push(TAG_PUT);
+                    write_bytes(&mut payload, key)?;
+                    write_bytes(&mut payload, value)?;
+                }
+                WalOp::Delete(key) => {
+                    payload.push(TAG_TOMBSTONE);
+                    write_bytes(&mut payload, key)?;
+                }
+            }
+        }
         write_frame(&mut self.file, &payload)?;
         self.file.sync_data()
     }
@@ -93,12 +109,12 @@ impl Wal {
         while let Frame::Ok(payload) = read_frame(&mut reader)? {
             // The checksum only proves the payload's bytes weren't cut
             // short or corrupted, not that they actually decode into a
-            // valid tag/seq/key/value record. A structurally-too-short or
-            // otherwise malformed payload gets the same lenient treatment
-            // as a bad frame instead of propagating as a hard error, that's
-            // exactly what happens trying to replay a WAL written in an
-            // older, incompatible format: this record (and anything after
-            // it, which is equally untrustworthy at that point) is dropped
+            // valid record. A structurally-too-short or otherwise malformed
+            // payload gets the same lenient treatment as a bad frame
+            // instead of propagating as a hard error, that's exactly what
+            // happens trying to replay a WAL written in an older,
+            // incompatible format: this record (and anything after it,
+            // which is equally untrustworthy at that point) is dropped
             // rather than bricking the whole open.
             match parse_payload(payload) {
                 Ok(record) => records.push(record),
@@ -112,27 +128,35 @@ impl Wal {
 
 fn parse_payload(payload: Vec<u8>) -> io::Result<WalRecord> {
     let mut cursor = Cursor::new(payload);
-    let mut tag = [0u8; 1];
-    cursor.read_exact(&mut tag)?;
 
     let mut seq_buf = [0u8; 8];
     cursor.read_exact(&mut seq_buf)?;
     let seq = u64::from_le_bytes(seq_buf);
 
-    let key = read_bytes(&mut cursor)?;
+    let mut count_buf = [0u8; 4];
+    cursor.read_exact(&mut count_buf)?;
+    let count = u32::from_le_bytes(count_buf);
 
-    let value = match tag[0] {
-        TAG_PUT => EntryValue::Value(read_bytes(&mut cursor)?),
-        TAG_TOMBSTONE => EntryValue::Tombstone,
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown wal record tag: {other}"),
-            ));
-        }
-    };
+    let mut ops = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mut tag = [0u8; 1];
+        cursor.read_exact(&mut tag)?;
+        let key = read_bytes(&mut cursor)?;
 
-    Ok(WalRecord { key, entry: Entry { seq, value } })
+        let op = match tag[0] {
+            TAG_PUT => WalOp::Put(key, read_bytes(&mut cursor)?),
+            TAG_TOMBSTONE => WalOp::Delete(key),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown wal op tag: {other}"),
+                ));
+            }
+        };
+        ops.push(op);
+    }
+
+    Ok(WalRecord { seq, ops })
 }
 
 #[cfg(test)]
@@ -151,8 +175,8 @@ mod tests {
 
         {
             let mut wal = Wal::open(&path).unwrap();
-            wal.append_put(0, b"foo", b"bar").unwrap();
-            wal.append_put(1, b"baz", b"qux").unwrap();
+            wal.append(0, &[WalOp::Put(b"foo".to_vec(), b"bar".to_vec())]).unwrap();
+            wal.append(1, &[WalOp::Put(b"baz".to_vec(), b"qux".to_vec())]).unwrap();
         }
 
         // Simulate a crash mid-append: chop the last few bytes off the
@@ -165,7 +189,7 @@ mod tests {
 
         let records = Wal::replay(&path).unwrap();
         assert_eq!(records.len(), 1, "the torn second record should be dropped, not error");
-        assert_eq!(records[0].key, b"foo");
+        assert!(matches!(&records[0].ops[0], WalOp::Put(k, _) if k == b"foo"));
 
         fs::remove_file(&path).unwrap();
     }
@@ -177,8 +201,8 @@ mod tests {
 
         {
             let mut wal = Wal::open(&path).unwrap();
-            wal.append_put(0, b"foo", b"bar").unwrap();
-            wal.append_put(1, b"baz", b"qux").unwrap();
+            wal.append(0, &[WalOp::Put(b"foo".to_vec(), b"bar".to_vec())]).unwrap();
+            wal.append(1, &[WalOp::Put(b"baz".to_vec(), b"qux".to_vec())]).unwrap();
         }
 
         // Flip a byte inside the second record's payload without touching
@@ -190,7 +214,7 @@ mod tests {
 
         let records = Wal::replay(&path).unwrap();
         assert_eq!(records.len(), 1, "corrupted second record should be dropped, not error");
-        assert_eq!(records[0].key, b"foo");
+        assert!(matches!(&records[0].ops[0], WalOp::Put(k, _) if k == b"foo"));
 
         fs::remove_file(&path).unwrap();
     }
@@ -207,12 +231,12 @@ mod tests {
 
         {
             let mut wal = Wal::open(&path).unwrap();
-            wal.append_put(0, b"foo", b"bar").unwrap();
+            wal.append(0, &[WalOp::Put(b"foo".to_vec(), b"bar".to_vec())]).unwrap();
         }
 
         // Append a second, well-framed record whose payload is empty, this
         // passes the length+checksum check on its own terms but is far too
-        // short to contain even a tag byte.
+        // short to contain even the seq/count header.
         {
             let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
             crate::encoding::write_frame(&mut file, &[]).unwrap();
@@ -220,7 +244,40 @@ mod tests {
 
         let records = Wal::replay(&path).unwrap();
         assert_eq!(records.len(), 1, "the malformed record should be dropped, not error");
-        assert_eq!(records[0].key, b"foo");
+        assert!(matches!(&records[0].ops[0], WalOp::Put(k, _) if k == b"foo"));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// The actual point of unifying single writes and batches onto one wire
+    /// format: a torn write during a multi-op batch must lose the whole
+    /// batch, never leave some of its keys applied and others not.
+    #[test]
+    fn replay_drops_an_entire_torn_batch_not_just_part_of_it() {
+        let path = temp_wal_path("torn_batch");
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(0, &[WalOp::Put(b"before".to_vec(), b"1".to_vec())]).unwrap();
+            wal.append(
+                1,
+                &[
+                    WalOp::Put(b"batch-a".to_vec(), b"2".to_vec()),
+                    WalOp::Put(b"batch-b".to_vec(), b"3".to_vec()),
+                ],
+            )
+            .unwrap();
+        }
+
+        let full_len = fs::metadata(&path).unwrap().len();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_len - 5).unwrap();
+        drop(file);
+
+        let records = Wal::replay(&path).unwrap();
+        assert_eq!(records.len(), 1, "only the untouched first record should survive");
+        assert!(matches!(&records[0].ops[0], WalOp::Put(k, _) if k == b"before"));
 
         fs::remove_file(&path).unwrap();
     }

@@ -14,6 +14,7 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 /// Bloom filter sidecar (`<id>.bloom`) that lets `get` skip opening the data
 /// file entirely for keys that definitely aren't in it. No other index yet,
 /// a key that might be present still costs a linear scan.
+#[derive(Clone)]
 pub struct SsTable {
     id: u64,
     path: PathBuf,

@@ -17,6 +17,9 @@ use merge::{MergeIter, SourceIter};
 use sstable::SsTable;
 use wal::Wal;
 
+/// One write within a batch passed to `Db::write_batch`.
+pub use wal::WalOp as WriteOp;
+
 /// Memtable flushes to a new SSTable once its approximate size crosses this.
 /// Small on purpose so it's easy to trigger and observe without huge inputs.
 const FLUSH_THRESHOLD_BYTES: usize = 1024;
@@ -39,13 +42,13 @@ pub struct Db {
     /// Oldest first. Reads walk this in reverse so the newest flush wins.
     sstables: Vec<SsTable>,
     next_sstable_id: u64,
-    /// Monotonic counter stamped onto every entry. Not load-bearing for
-    /// correctness yet, current recency is already handled by "memtable
-    /// wins, then newest sstable wins". It becomes load-bearing once
-    /// compaction needs to merge sstables with overlapping key ranges and
-    /// once MVCC (milestone 11) needs point-in-time snapshots. Recovered on
-    /// open from the manifest's last committed value plus whatever the WAL
-    /// replay pushes it forward by.
+    /// Monotonic counter, one shared value stamped onto every operation in
+    /// a single `put`/`delete`/`write_batch` call, that sharing is what a
+    /// batch's atomicity is actually built on, see `write_batch`. Not
+    /// load-bearing for the recency decisions `get`/`range` make (that's
+    /// "memtable wins, then newest sstable wins"). Recovered on open from
+    /// the manifest's last committed value plus whatever the WAL replay
+    /// pushes it forward by.
     next_seq: u64,
 }
 
@@ -98,8 +101,11 @@ impl Db {
         let wal_path = dir.join("wal.log");
         let mut data = BTreeMap::new();
         for record in Wal::replay(&wal_path)? {
-            next_seq = next_seq.max(record.entry.seq + 1);
-            data.insert(record.key, record.entry);
+            next_seq = next_seq.max(record.seq + 1);
+            for op in record.ops {
+                let (key, entry) = op_to_entry(record.seq, op);
+                data.insert(key, entry);
+            }
         }
         let memtable_size_bytes = data.iter().map(|(k, e)| entry_size(k, e)).sum();
 
@@ -116,38 +122,11 @@ impl Db {
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        if let Some(wal) = &mut self.wal {
-            wal.append_put(seq, &key, &value)?;
-        }
-
-        let entry = Entry { seq, value: EntryValue::Value(value) };
-        let old_size = self.data.get(&key).map_or(0, |old| entry_size(&key, old));
-        let new_size = entry_size(&key, &entry);
-        self.memtable_size_bytes = self.memtable_size_bytes.saturating_sub(old_size) + new_size;
-        self.data.insert(key, entry);
-
-        self.maybe_flush()?;
-        Ok(())
+        self.write_batch(vec![WriteOp::Put(key, value)])
     }
 
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if let Some(entry) = self.data.get(key) {
-            return Ok(match &entry.value {
-                EntryValue::Value(v) => Some(v.clone()),
-                EntryValue::Tombstone => None,
-            });
-        }
-        for sstable in self.sstables.iter().rev() {
-            if let Some(entry) = sstable.get(key)? {
-                return Ok(match entry.value {
-                    EntryValue::Value(v) => Some(v),
-                    EntryValue::Tombstone => None,
-                });
-            }
-        }
-        Ok(None)
+        lookup(&self.data, &self.sstables, key)
     }
 
     /// Writes a tombstone for the key instead of just removing it, so the
@@ -161,21 +140,65 @@ impl Db {
     /// is exactly what Bloom filters (milestone 5) exist to cut down.
     pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
         let existed = self.get(key)?.is_some();
+        self.write_batch(vec![WriteOp::Delete(key.to_vec())])?;
+        Ok(existed)
+    }
+
+    /// Applies every operation in `ops` as one atomic unit: either all of
+    /// them are durable together, or (after a crash before this call
+    /// returns) none of them are, a reader never sees a partial batch. A
+    /// lone `put`/`delete` is just a batch of one under the hood, both go
+    /// through this same path.
+    ///
+    /// This reuses the WAL's existing frame-level atomicity (milestone 9)
+    /// rather than needing new machinery: the whole batch is written as one
+    /// checksummed frame sharing a single sequence number, so a torn write
+    /// during it loses the entire frame, not just part of it, exactly the
+    /// same guarantee a single record already had.
+    pub fn write_batch(&mut self, ops: Vec<WriteOp>) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
 
         let seq = self.next_seq;
         self.next_seq += 1;
+
         if let Some(wal) = &mut self.wal {
-            wal.append_tombstone(seq, key)?;
+            wal.append(seq, &ops)?;
         }
 
-        let entry = Entry { seq, value: EntryValue::Tombstone };
-        let old_size = self.data.get(key).map_or(0, |old| entry_size(key, old));
-        let new_size = entry_size(key, &entry);
-        self.memtable_size_bytes = self.memtable_size_bytes.saturating_sub(old_size) + new_size;
-        self.data.insert(key.to_vec(), entry);
+        for op in ops {
+            let (key, entry) = op_to_entry(seq, op);
+            let old_size = self.data.get(&key).map_or(0, |old| entry_size(&key, old));
+            let new_size = entry_size(&key, &entry);
+            self.memtable_size_bytes = self.memtable_size_bytes.saturating_sub(old_size) + new_size;
+            self.data.insert(key, entry);
+        }
 
         self.maybe_flush()?;
-        Ok(existed)
+        Ok(())
+    }
+
+    /// Freeze a point-in-time, read-only view of the database: a copy of
+    /// the current memtable plus the current list of sstables, both taken
+    /// right now. Safe to keep using after any later `put`/`delete`/`flush`
+    /// on this `Db`, flush only ever adds new sstable files, it never
+    /// removes existing ones, so the files this snapshot references stay
+    /// exactly as they were.
+    ///
+    /// **Not** safe across `compact()`, which does delete old sstable files
+    /// once they're merged away. Reading through a snapshot taken before a
+    /// compaction that has since run surfaces a file-not-found `io::Error`
+    /// rather than silently serving stale-but-valid data, seeing why is
+    /// worth walking through: full snapshot isolation across compaction
+    /// would need the sstables a live snapshot still needs to be reference
+    /// counted so compaction knows not to delete them yet, real MVCC
+    /// storage engines do exactly this. That's a legitimate further
+    /// extension, not implemented here, this milestone's snapshots cover
+    /// the more common case (a consistent read while writes continue)
+    /// without it.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot { data: self.data.clone(), sstables: self.sstables.clone() }
     }
 
     /// Number of entries in the memtable, including tombstones not yet
@@ -195,12 +218,7 @@ impl Db {
     /// cheap, and nothing needs bounded scans yet either, that's a natural,
     /// cheap extension to add once something actually calls for it.
     pub fn range(&self) -> io::Result<MergeIter<'_>> {
-        let mut sources: Vec<SourceIter<'_>> = Vec::with_capacity(self.sstables.len() + 1);
-        for sstable in &self.sstables {
-            sources.push(Box::new(sstable.iter()?));
-        }
-        sources.push(Box::new(self.data.iter().map(|(k, e)| Ok((k.clone(), e.clone())))));
-        Ok(MergeIter::new(sources))
+        build_range(&self.sstables, &self.data)
     }
 
     pub fn sstable_count(&self) -> usize {
@@ -332,6 +350,64 @@ fn entry_size(key: &[u8], entry: &Entry) -> usize {
             EntryValue::Value(v) => v.len(),
             EntryValue::Tombstone => 0,
         }
+}
+
+fn op_to_entry(seq: u64, op: WriteOp) -> (Vec<u8>, Entry) {
+    match op {
+        WriteOp::Put(key, value) => (key, Entry { seq, value: EntryValue::Value(value) }),
+        WriteOp::Delete(key) => (key, Entry { seq, value: EntryValue::Tombstone }),
+    }
+}
+
+/// Shared by `Db::get` and `Snapshot::get`: check the memtable first, then
+/// sstables newest to oldest, a tombstone found anywhere stops the search
+/// and reports not-found rather than letting an older copy shadow it.
+fn lookup(data: &BTreeMap<Vec<u8>, Entry>, sstables: &[SsTable], key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    if let Some(entry) = data.get(key) {
+        return Ok(match &entry.value {
+            EntryValue::Value(v) => Some(v.clone()),
+            EntryValue::Tombstone => None,
+        });
+    }
+    for sstable in sstables.iter().rev() {
+        if let Some(entry) = sstable.get(key)? {
+            return Ok(match entry.value {
+                EntryValue::Value(v) => Some(v),
+                EntryValue::Tombstone => None,
+            });
+        }
+    }
+    Ok(None)
+}
+
+/// Shared by `Db::range` and `Snapshot::range`.
+fn build_range<'a>(
+    sstables: &'a [SsTable],
+    data: &'a BTreeMap<Vec<u8>, Entry>,
+) -> io::Result<MergeIter<'a>> {
+    let mut sources: Vec<SourceIter<'a>> = Vec::with_capacity(sstables.len() + 1);
+    for sstable in sstables {
+        sources.push(Box::new(sstable.iter()?));
+    }
+    sources.push(Box::new(data.iter().map(|(k, e)| Ok((k.clone(), e.clone())))));
+    Ok(MergeIter::new(sources))
+}
+
+/// A frozen, point-in-time read-only view of the database, see
+/// `Db::snapshot` for exactly what it is and isn't safe against.
+pub struct Snapshot {
+    data: BTreeMap<Vec<u8>, Entry>,
+    sstables: Vec<SsTable>,
+}
+
+impl Snapshot {
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        lookup(&self.data, &self.sstables, key)
+    }
+
+    pub fn range(&self) -> io::Result<MergeIter<'_>> {
+        build_range(&self.sstables, &self.data)
+    }
 }
 
 #[cfg(test)]
@@ -619,6 +695,134 @@ mod tests {
         assert_eq!(db.sstable_count(), 0, "orphan isn't in the manifest, so it's not active");
         assert_eq!(db.get(b"foo").unwrap(), Some(b"bar".to_vec()), "recovered via wal replay");
         assert_eq!(db.get(&orphan_key).unwrap(), None, "orphan's data was never committed");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_batch_applies_every_op_atomically_in_memory() {
+        let mut db = Db::new();
+        db.put(b"existing".to_vec(), b"old".to_vec()).unwrap();
+
+        db.write_batch(vec![
+            WriteOp::Put(b"alpha".to_vec(), b"1".to_vec()),
+            WriteOp::Put(b"bravo".to_vec(), b"2".to_vec()),
+            WriteOp::Delete(b"existing".to_vec()),
+        ])
+        .unwrap();
+
+        assert_eq!(db.get(b"alpha").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"bravo").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"existing").unwrap(), None);
+    }
+
+    #[test]
+    fn write_batch_survives_reopen_as_a_whole() {
+        let dir = temp_db_dir("batch_reopen");
+
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.write_batch(vec![
+                WriteOp::Put(b"alpha".to_vec(), b"1".to_vec()),
+                WriteOp::Put(b"bravo".to_vec(), b"2".to_vec()),
+            ])
+            .unwrap();
+        }
+
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.get(b"alpha").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"bravo").unwrap(), Some(b"2".to_vec()));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The actual payoff of unifying single writes and batches onto one WAL
+    /// frame per call: a torn write during a batch can't leave some of its
+    /// keys durable and others not, the whole frame is either recovered or
+    /// it isn't. Proven here at the `Db` level (`wal.rs` proves the same
+    /// thing at the record-parsing level directly).
+    #[test]
+    fn write_batch_is_all_or_nothing_across_a_crash() {
+        let dir = temp_db_dir("batch_torn");
+
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.put(b"before".to_vec(), b"1".to_vec()).unwrap();
+            db.write_batch(vec![
+                WriteOp::Put(b"batch-a".to_vec(), b"2".to_vec()),
+                WriteOp::Put(b"batch-b".to_vec(), b"3".to_vec()),
+            ])
+            .unwrap();
+        }
+
+        let wal_path = dir.join("wal.log");
+        let full_len = fs::metadata(&wal_path).unwrap().len();
+        let file = fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
+        file.set_len(full_len - 5).unwrap();
+        drop(file);
+
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.get(b"before").unwrap(), Some(b"1".to_vec()), "untouched record survives");
+        assert_eq!(db.get(b"batch-a").unwrap(), None, "neither half of the torn batch should land");
+        assert_eq!(db.get(b"batch-b").unwrap(), None, "neither half of the torn batch should land");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_is_unaffected_by_later_writes() {
+        let mut db = Db::new();
+        db.put(b"foo".to_vec(), b"v1".to_vec()).unwrap();
+
+        let snap = db.snapshot();
+
+        db.put(b"foo".to_vec(), b"v2".to_vec()).unwrap();
+        db.put(b"new-key".to_vec(), b"new".to_vec()).unwrap();
+        db.delete(b"foo").unwrap();
+
+        assert_eq!(snap.get(b"foo").unwrap(), Some(b"v1".to_vec()), "snapshot sees the old value");
+        assert_eq!(snap.get(b"new-key").unwrap(), None, "snapshot predates this key entirely");
+        assert_eq!(db.get(b"foo").unwrap(), None, "live db reflects the delete");
+        assert_eq!(db.get(b"new-key").unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_is_unaffected_by_a_later_flush() {
+        let dir = temp_db_dir("snapshot_flush");
+        let mut db = Db::open(&dir).unwrap();
+        db.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+
+        let snap = db.snapshot();
+        db.flush().unwrap();
+
+        assert_eq!(db.len(), 0, "live db's memtable was cleared by the flush");
+        assert_eq!(snap.get(b"foo").unwrap(), Some(b"bar".to_vec()), "snapshot's own copy is untouched");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Documents the known limitation, not a desired behavior: a snapshot
+    /// taken before a compaction that later deletes the sstables it
+    /// references fails loudly (a real io::Error) rather than silently
+    /// returning wrong data. See `Db::snapshot`'s docs for why this isn't
+    /// solved here.
+    #[test]
+    fn known_limitation_snapshot_read_fails_after_compaction_removes_its_sstables() {
+        let dir = temp_db_dir("snapshot_compact");
+        let mut db = Db::open(&dir).unwrap();
+
+        db.put(b"foo".to_vec(), b"1".to_vec()).unwrap();
+        db.flush().unwrap();
+        db.put(b"bar".to_vec(), b"2".to_vec()).unwrap();
+        db.flush().unwrap();
+
+        let snap = db.snapshot();
+        db.compact().unwrap();
+
+        assert!(
+            snap.get(b"foo").is_err(),
+            "the sstable this snapshot references no longer exists on disk"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
