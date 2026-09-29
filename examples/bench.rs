@@ -13,7 +13,9 @@
 //! compaction's effect look more dramatic here than they would in practice,
 //! the mechanism being demonstrated is real, the scale is exaggerated.
 
-use std::fs;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,48 @@ use rand::seq::SliceRandom;
 use vellumdb::Db;
 
 const VALUE_SIZE: usize = 100;
+
+/// The dumbest possible persistent key-value store: everything lives in a
+/// `HashMap` in memory, and every single write rewrites the *entire* map to
+/// one file on disk from scratch. This is the baseline VellumDB's actual
+/// complexity (WAL, memtable, SSTables, compaction, Bloom filters, ...)
+/// needs to justify itself against, not a strawman, this genuinely is what
+/// "just persist a hashmap" looks like without any of that machinery.
+struct NaiveStore {
+    path: PathBuf,
+    data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl NaiveStore {
+    fn open(path: PathBuf) -> Self {
+        NaiveStore { path, data: HashMap::new() }
+    }
+
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.data.insert(key, value);
+        self.rewrite_to_disk();
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
+        self.data.get(key)
+    }
+
+    /// O(n) in the size of the *entire* dataset, on every single write.
+    /// That's the whole point: this is the cost VellumDB's WAL + memtable +
+    /// periodic flush exists to avoid.
+    fn rewrite_to_disk(&self) {
+        let mut buf = Vec::new();
+        for (k, v) in &self.data {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        let mut file = File::create(&self.path).unwrap();
+        file.write_all(&buf).unwrap();
+        file.sync_all().unwrap();
+    }
+}
 
 struct Stats {
     count: usize,
@@ -184,6 +228,100 @@ fn bench_range_scan(n: usize) -> Duration {
     elapsed
 }
 
+/// Same shape as `bench_sequential_writes`/`bench_random_writes` but against
+/// `NaiveStore` instead of `Db`, so the two are directly comparable at the
+/// same n. Kept much smaller than the main write benchmarks, a full rewrite
+/// per write is O(n) each, O(n^2) total, that's the entire point being
+/// measured, not a bug to work around.
+fn bench_naive_writes(dir_name: &str, n: usize, shuffle_order: bool) -> Stats {
+    let dir = fresh_dir(dir_name);
+    fs::create_dir_all(&dir).unwrap();
+    let mut store = NaiveStore::open(dir.join("naive.db"));
+
+    let mut order: Vec<usize> = (0..n).collect();
+    if shuffle_order {
+        order.shuffle(&mut rng());
+    }
+
+    let mut samples = Vec::with_capacity(n);
+    for i in order {
+        let key = format!("key-{i:08}").into_bytes();
+        let start = Instant::now();
+        store.put(key, value(i));
+        samples.push(start.elapsed());
+    }
+    let s = stats(samples);
+    fs::remove_dir_all(&dir).ok();
+    s
+}
+
+fn naive_populated_store(dir: &Path, n: usize) -> NaiveStore {
+    let mut store = NaiveStore::open(dir.join("naive.db"));
+    for i in 0..n {
+        store.put(format!("key-{i:08}").into_bytes(), value(i));
+    }
+    store
+}
+
+fn bench_naive_existing_key_reads(n: usize, lookups: usize) -> Stats {
+    let dir = fresh_dir("naive_existing_reads");
+    fs::create_dir_all(&dir).unwrap();
+    let store = naive_populated_store(&dir, n);
+
+    let mut keys: Vec<usize> = (0..n).collect();
+    keys.shuffle(&mut rng());
+    keys.truncate(lookups);
+
+    let mut samples = Vec::with_capacity(lookups);
+    for i in keys {
+        let key = format!("key-{i:08}").into_bytes();
+        let start = Instant::now();
+        let found = store.get(&key);
+        samples.push(start.elapsed());
+        assert!(found.is_some());
+    }
+    let s = stats(samples);
+    fs::remove_dir_all(&dir).ok();
+    s
+}
+
+fn bench_naive_missing_key_reads(n: usize, lookups: usize) -> Stats {
+    let dir = fresh_dir("naive_missing_reads");
+    fs::create_dir_all(&dir).unwrap();
+    let store = naive_populated_store(&dir, n);
+
+    let mut samples = Vec::with_capacity(lookups);
+    for i in 0..lookups {
+        let key = format!("missing-{i:08}").into_bytes();
+        let start = Instant::now();
+        let found = store.get(&key);
+        samples.push(start.elapsed());
+        assert!(found.is_none());
+    }
+    let s = stats(samples);
+    fs::remove_dir_all(&dir).ok();
+    s
+}
+
+/// Fair comparison with `Db::range()`: that already returns sorted data, a
+/// `HashMap` doesn't, so this times collecting *and* sorting, not just the
+/// iteration, "give me my data back in order" is the actual feature being
+/// compared, not raw iteration speed.
+fn bench_naive_range_scan(n: usize) -> Duration {
+    let dir = fresh_dir("naive_range_scan");
+    fs::create_dir_all(&dir).unwrap();
+    let store = naive_populated_store(&dir, n);
+
+    let start = Instant::now();
+    let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = store.data.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let elapsed = start.elapsed();
+    assert_eq!(entries.len(), n);
+
+    fs::remove_dir_all(&dir).ok();
+    elapsed
+}
+
 /// Write amplification: how many bytes actually got written to sstable
 /// files over the workload's lifetime (every flush, plus compaction
 /// rewriting merged data) versus the logical size of the live data at the
@@ -298,5 +436,68 @@ fn main() {
     println!(
         "wal rotation speedup: {:.1}x",
         unflushed.as_secs_f64() / flushed.as_secs_f64().max(0.000_001)
+    );
+
+    // --- naive baseline: plain HashMap + full file rewrite on every write ---
+    // Kept at a much smaller n than everything above, a full rewrite per
+    // write is O(n) each, O(n^2) total, this is exactly the cost VellumDB's
+    // WAL + memtable + periodic flush exists to avoid, running it at n=1000
+    // would take minutes instead of seconds.
+    let n = 200;
+    let lookups = 100;
+
+    header(&format!("Naive baseline vs VellumDB (n={n})"));
+    println!("baseline: HashMap in memory, rewrites the ENTIRE dataset to disk on every put");
+
+    println!("\n-- sequential writes --");
+    let db_seq = bench_sequential_writes(n);
+    let naive_seq = bench_naive_writes("naive_seq", n, false);
+    println!("vellumdb: {db_seq}");
+    println!("naive:    {naive_seq}");
+    println!(
+        "vellumdb is {:.1}x faster",
+        naive_seq.total.as_secs_f64() / db_seq.total.as_secs_f64()
+    );
+
+    println!("\n-- random writes --");
+    let db_rand = bench_random_writes(n);
+    let naive_rand = bench_naive_writes("naive_rand", n, true);
+    println!("vellumdb: {db_rand}");
+    println!("naive:    {naive_rand}");
+    println!(
+        "vellumdb is {:.1}x faster",
+        naive_rand.total.as_secs_f64() / db_rand.total.as_secs_f64()
+    );
+
+    println!("\n-- existing-key reads --");
+    let db_exist = bench_existing_key_reads(n, lookups);
+    let naive_exist = bench_naive_existing_key_reads(n, lookups);
+    println!("vellumdb: {db_exist}");
+    println!("naive:    {naive_exist}");
+    println!(
+        "naive is {:.1}x faster (everything's already in memory, no bloom/file-scan cost)",
+        db_exist.total.as_secs_f64() / naive_exist.total.as_secs_f64()
+    );
+
+    println!("\n-- missing-key reads --");
+    let (db_missing, _, _) = bench_missing_key_reads(n, lookups);
+    let naive_missing = bench_naive_missing_key_reads(n, lookups);
+    println!("vellumdb: {db_missing}");
+    println!("naive:    {naive_missing}");
+
+    println!("\n-- range scan (sorted output) --");
+    let db_range = bench_range_scan(n);
+    let naive_range = bench_naive_range_scan(n);
+    println!("vellumdb: {db_range:?} (already sorted, no extra work)");
+    println!("naive:    {naive_range:?} (collect + sort, a HashMap has no ordering)");
+
+    println!(
+        "\ninterpretation: naive wins on reads here because everything lives in RAM with zero \
+         per-op disk cost, that's only possible because its write path is O(n) per write and its \
+         memory use is unbounded. VellumDB bounds both (WAL + periodic flush cap memory, Bloom \
+         filters cap the read-side cost of that) and the trade is a real read cost, small at this \
+         scale, but a naive full-rewrite store fundamentally cannot scale its write path at all, \
+         a database that takes longer to write the millionth key than the first isn't viable at \
+         any real size, which is the whole reason the rest of this engine exists."
     );
 }
