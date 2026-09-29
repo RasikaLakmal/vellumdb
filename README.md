@@ -153,6 +153,10 @@ Covers sequential/random writes, existing/missing-key reads, range scans, write 
 
 The naive comparison is deliberately two-sided: VellumDB already wins on writes even at this small scale, but the naive store wins dramatically on reads, because it holds everything in memory with no per-op disk cost at all. That's only possible because its write path is O(n) per write and its memory use is unbounded, VellumDB bounds both and pays a real, small read-side cost for it. A store that takes longer to write the millionth key than the first isn't viable at any real size, which is the actual argument for all the complexity above.
 
+## Failure experiments
+
+[docs/failure-experiments.md](docs/failure-experiments.md) — five deliberate ways this was broken on purpose (mid-write process kills, hand-corrupted records, simulated crashes between a flush and its manifest commit, a torn multi-key batch), plus one real bug found by accident while testing all of it, not by a planned test case.
+
 ## Known limitations
 
 Documented deliberately, not hidden:
