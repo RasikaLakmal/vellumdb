@@ -85,6 +85,15 @@ impl SsTable {
         if !self.bloom.might_contain(key) {
             return Ok(None);
         }
+        self.get_ignoring_bloom(key)
+    }
+
+    /// The linear scan `get` falls back to, without the Bloom filter check
+    /// in front of it. Exists so `examples/bench.rs` can measure what a
+    /// missing-key lookup costs without milestone 5's optimization, not
+    /// meant for normal use.
+    #[doc(hidden)]
+    pub fn get_ignoring_bloom(&self, key: &[u8]) -> io::Result<Option<Entry>> {
         for item in self.iter()? {
             let (k, entry) = item?;
             if k == key {

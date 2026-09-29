@@ -129,6 +129,31 @@ impl Db {
         lookup(&self.data, &self.sstables, key)
     }
 
+    /// Same as `get`, but skips every sstable's Bloom filter check and
+    /// always falls through to the linear scan. Exists purely so
+    /// `examples/bench.rs` can measure what a missing-key lookup costs
+    /// without milestone 5's optimization, giving an actual before/after
+    /// comparison instead of just asserting the filter helps. Not meant for
+    /// normal use.
+    #[doc(hidden)]
+    pub fn get_without_bloom_filters(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if let Some(entry) = self.data.get(key) {
+            return Ok(match &entry.value {
+                EntryValue::Value(v) => Some(v.clone()),
+                EntryValue::Tombstone => None,
+            });
+        }
+        for sstable in self.sstables.iter().rev() {
+            if let Some(entry) = sstable.get_ignoring_bloom(key)? {
+                return Ok(match entry.value {
+                    EntryValue::Value(v) => Some(v),
+                    EntryValue::Tombstone => None,
+                });
+            }
+        }
+        Ok(None)
+    }
+
     /// Writes a tombstone for the key instead of just removing it, so the
     /// delete survives being carried forward across a flush: even once an
     /// older SSTable still holds a stale value for this key, the tombstone
